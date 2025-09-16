@@ -3,3 +3,6 @@
 build/
 tags
 autograder.zip
+
+# macOS cache files
+*.DS_Store
