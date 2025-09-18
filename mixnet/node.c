@@ -13,6 +13,8 @@
 #include "packet.h"
 #include "log.h"
 #include "stp.h"
+#include "lsa.h"
+#include "util.h"
 
 #include <stdio.h>
 #include <stdint.h>
@@ -22,31 +24,14 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <stdarg.h>
-
-// STP functionality moved to stp.h and stp.c
-
-// Forward declarations
-static void process_flood_packet(mixnet_packet *packet, 
-                            uint8_t port, const struct mixnet_node_config *config,
-                            void *handle);
-
-// Helper function to create and send STP packet
-// STP functions moved to stp.c module
  
-static void process_flood_packet(mixnet_packet *packet, 
-                               uint8_t port, const struct mixnet_node_config *config,
-                               void *handle) {
+static void process_flood_packet(mixnet_packet *packet, uint8_t port, 
+    const struct mixnet_node_config *config, void *handle) {
      // Check if port is blocked by STP
      if (packet->type != PACKET_TYPE_FLOOD || stp_is_port_blocked(port)) return;
 
-     const stp_state_t *stp_state = stp_get_state();
-     if (!stp_state) {
-         LOG_ERROR("STP not initialized, dropping flood packet");
-         return;
-     }
-
      LOG_DEBUG("Processing FLOOD packet | from port %d | size %d | parent port %d", 
-               port, packet->total_size, stp_state->parent_port);
+               port, packet->total_size, stp_state.parent_port);
 
      // Validate packet size for flood packets (should be just the header)
      if (packet->total_size != sizeof(mixnet_packet)) {
@@ -88,8 +73,71 @@ static void process_flood_packet(mixnet_packet *packet,
     }
 }
 
-// Helper function to update port blocking state
-// STP functions moved to stp.c module
+
+static void process_data_packet(mixnet_packet *packet , uint8_t port, 
+    const struct mixnet_node_config *config , void *handle) {
+    if (packet->type != PACKET_TYPE_DATA) return;
+
+    mixnet_packet_routing_header *data_payload = (mixnet_packet_routing_header*)((char*)packet + sizeof(mixnet_packet));
+    // mixnet_packet_routing_header *rh = (mixnet_packet_routing_header*)packet->payload();
+    mixnet_address src_address = data_payload->src_address;
+    mixnet_address dst_address = data_payload->dst_address;
+    uint16_t route_length = data_payload->route_length;
+    uint16_t hop_index = data_payload->hop_index;
+    
+    LOG_DEBUG("Processing DATA packet | from port %d | size %d | src_address %d | dst_address %d | route_length %d | hop_index %d", 
+        port, packet->total_size, src_address, dst_address, route_length, hop_index);
+    
+    if (src_address == node_state.self_address) {
+        // iter through lsa_state.routes
+        for (uint16_t i = 0; i < lsa_state.num_routes; i++) {
+            lsa_route *route = &lsa_state.routes[i];
+            if (route->dst_addr != dst_address) {
+                continue;
+            }
+            if (route->hop_count == 0) {
+                LOG_DEBUG("Direct connection to %d", route->dst_addr);
+            } else {
+                LOG_DEBUG("Route to %d (%d hops): ", route->dst_addr, route->hop_count);
+            }
+        }
+        return;
+    }
+
+    if (dst_address == node_state.self_address) {
+        mixnet_packet *app_packet = (mixnet_packet*)malloc(packet->total_size);
+        memcpy(app_packet, packet, packet->total_size);
+        mixnet_send(handle, config->num_neighbors, app_packet);
+        free(app_packet);
+        return;
+    }
+
+
+    (void)handle;
+    (void)config;
+}
+
+static void process_ping_packet(mixnet_packet *packet, uint8_t port, 
+    const struct mixnet_node_config *config, void *handle) {
+    if (packet->type != PACKET_TYPE_PING) return;
+
+    LOG_DEBUG("Processing PING packet | from port %d | size %d", 
+              port, packet->total_size);
+
+    // Parse routing header
+    if (packet->total_size < sizeof(mixnet_packet) + sizeof(mixnet_packet_routing_header) + sizeof(mixnet_packet_ping)) {
+        LOG_ERROR("PING packet too small: %u", packet->total_size);
+        return;
+    }
+
+    char *payload_base = (char*)packet + sizeof(mixnet_packet);
+    mixnet_packet_routing_header *rh = (mixnet_packet_routing_header*)payload_base;
+    mixnet_packet_ping *pp = (mixnet_packet_ping*)(payload_base + sizeof(mixnet_packet_routing_header) + (sizeof(mixnet_address) * rh->route_length));
+
+    (void)handle;
+    (void)config;
+    (void)pp;
+}
 
 void recv_packet(void *const handle, const struct mixnet_node_config *const config) {
     // Handle received packet
@@ -98,36 +146,33 @@ void recv_packet(void *const handle, const struct mixnet_node_config *const conf
     
     // Try to receive packets
     int recv_count = mixnet_recv(handle, &port, &packet);
-    if (recv_count > 0) {
-        // Get STP state for logging
-        const stp_state_t *stp_state = stp_get_state();
-        if (stp_state) {
-            char ports_block_state[256] = {0};
-            int n = 0;
-            for (uint8_t p = 0; p < config->num_neighbors; p++) {
-                n += snprintf(ports_block_state + n, sizeof(ports_block_state) - n, 
-                             "%d ", stp_is_port_blocked(p));
-            }
-            LOG_DEBUG("Received %d packets on port %d | type %d | packet size %d | block state %s", 
-                     recv_count, port, packet->type, packet->total_size, ports_block_state);
-        } else {
-            LOG_DEBUG("Received %d packets on port %d | type %d | packet size %d", 
-                     recv_count, port, packet->type, packet->total_size);
-        }
-        
-        // Process STP packets
-        if (packet->type == PACKET_TYPE_STP) {
-            stp_process_packet(packet, port, config, handle);
-        }
-
-        // Process flood packets
-        if (packet->type == PACKET_TYPE_FLOOD) {
-            process_flood_packet(packet, port, config, handle);
-        }
-        
-        // Free the packet after processing
-        free(packet);
+    if (recv_count <= 0) {
+        return;
     }
+
+    switch (packet->type) {
+        case PACKET_TYPE_STP:
+            process_stp_packet(packet, port, config, handle);
+            break;
+        case PACKET_TYPE_FLOOD:
+            process_flood_packet(packet, port, config, handle);
+            break;
+        case PACKET_TYPE_LSA:
+            process_lsa_packet(packet, port, config, handle);
+            break;
+        case PACKET_TYPE_DATA:
+            process_data_packet(packet, port, config, handle);
+            break;
+        case PACKET_TYPE_PING:
+            process_ping_packet(packet, port, config, handle);
+            break;
+        default:
+            LOG_ERROR("Unknown packet type %d received on port %d", packet->type, port);
+            break;
+    }
+    
+    // Free the packet after processing
+    free(packet);
 }
 
 void run_node(void *const handle,
@@ -148,11 +193,23 @@ void run_node(void *const handle,
 
     // Initialize STP
     stp_init(handle, &c);
+
+    // Initialize LSA
+    // lsa_init(handle, &c);
     
     while(*keep_running) {
         // Check if STP has converged
-        check_stp_converged();
+        if(node_state.stage == 0 && check_converged()) {
+            LOG_INFO("Node converged | root %d | path length %d | parent addr %d | parent port %d | is_root %d", 
+                    stp_state.root_address, stp_state.path_length, node_state.neighbor_addrs[stp_state.parent_port], 
+                    stp_state.parent_port, stp_state.is_root);
+            // lsa_compute_routes();
 
+            // lsa_print_graph();
+            // lsa_print_routes();
+        }
+
+        // Receive and process packets, check if returned > 0
         recv_packet(handle, &c);
         
         stp_send_periodic_hello(handle, &c);
@@ -161,7 +218,7 @@ void run_node(void *const handle,
         stp_check_reelection(handle, &c);
     }
     
-    // Cleanup STP and logging systems
-    stp_cleanup();
+    // Cleanup states and logging systems
     log_cleanup();
 }
+

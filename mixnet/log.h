@@ -114,13 +114,6 @@ void log_message_v(log_level_t level, const char *file, int line, const char *fu
 void log_flush(void);
 
 /**
- * @brief Get current time in milliseconds since epoch
- * 
- * @return Current time in milliseconds
- */
-uint64_t log_get_time_ms(void);
-
-/**
  * @brief Get string representation of log level
  * 
  * @param level Log level

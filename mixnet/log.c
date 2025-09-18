@@ -10,6 +10,7 @@
  */
 
 #include "log.h"
+#include "util.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -96,6 +97,10 @@ int log_init(const log_config_t *config) {
                     g_log_state.config.log_file, strerror(errno));
             return -1;
         }
+        setvbuf(g_log_state.log_file, NULL, _IOLBF, 0);
+    }
+    else {
+        setvbuf(stdout, NULL, _IOLBF, 0);
     }
 
     // Setup colors if enabled and outputting to terminal
@@ -203,14 +208,6 @@ void log_flush(void) {
     pthread_mutex_unlock(&g_log_state.mutex);
 }
 
-uint64_t log_get_time_ms(void) {
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
-        return 0;
-    }
-    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
 const char *log_level_to_string(log_level_t level) {
     if (level >= LOG_LEVEL_COUNT) {
         return "UNKNOWN";
@@ -276,10 +273,11 @@ static void log_output_message(log_level_t level, const char *file, int line,
     }
 
     // Ensure newline
-    if (message[strlen(message) - 1] != '\n') {
+    if (strlen(message) == 0 ||message[strlen(message) - 1] != '\n') {
         fprintf(output, "\n");
     }
 
+    fflush(output);
     pthread_mutex_unlock(&g_log_state.mutex);
 }
 

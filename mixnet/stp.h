@@ -13,10 +13,11 @@
  #ifndef STP_H
  #define STP_H
  
- #include <stdint.h>
- #include <stdbool.h>
- #include "packet.h"
- #include "config.h"
+#include <stdint.h>
+#include <stdbool.h>
+#include "packet.h"
+#include "config.h"
+#include "state.h"
  
  #ifdef __cplusplus
  extern "C" {
@@ -24,25 +25,6 @@
  
  // STP constants
  #define STP_HELLO_PATH_LEN_THRESHOLD 0x8000
- 
- // STP state structure
- typedef struct {
-     mixnet_address self_address;        // This node's address
-     uint8_t stage;                      // Current STP stage. 0: initial, 1: converged
-     uint64_t init_time;                 // Time when stp election started
-     mixnet_address root_address;        // Current root address
-     uint16_t path_length;               // Path length to root
-     mixnet_address parent_address;      // Parent node address
-     uint8_t parent_port;                // Port to parent
-     bool is_root;                       // Whether this node is the root
-     bool *ports_blocked;                // Blocked state for each port (dynamic)
-     mixnet_address *neighbor_addrs;     // Map port -> neighbor address (dynamic)
-     uint64_t last_hello_time;           // Last time we sent a hello
-     uint64_t last_root_heard_time;      // Last time we started reelection
- } stp_state_t;
- 
- // Global STP configuration
- extern uint32_t stp_convergence_time_ms_;
  
  /**
   * @brief Initialize STP state for a node
@@ -60,7 +42,7 @@
   * @param config Node configuration
   * @param handle Network handle
   */
- void stp_process_packet(mixnet_packet *packet, uint8_t port, 
+ void process_stp_packet(mixnet_packet *packet, uint8_t port, 
                         const struct mixnet_node_config *config, void *handle);
  
  /**
@@ -79,13 +61,6 @@
  void stp_update_port_blocking(const struct mixnet_node_config *config);
  
  /**
-  * @brief Check if STP has converged
-  * 
-  * @return true if STP is converged, false otherwise
-  */
- void check_stp_converged(void);
- 
- /**
   * @brief Check if a port is blocked
   * 
   * @param port Port number to check
@@ -93,12 +68,6 @@
   */
  bool stp_is_port_blocked(uint8_t port);
  
- /**
-  * @brief Get current STP state
-  * 
-  * @return Pointer to current STP state
-  */
- stp_state_t* stp_get_state(void);
  
  /**
   * @brief Cleanup STP resources
