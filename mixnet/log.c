@@ -66,6 +66,8 @@ static struct {
     .thread_id = 0
 };
 
+uint64_t log_start_time = 0;
+
 // Internal function declarations
 static void log_output_message(log_level_t level, const char *file, int line, 
                               const char *func, const char *message);
@@ -74,6 +76,7 @@ static const char *log_get_filename(const char *filepath);
 static void log_setup_colors(void);
 
 int log_init(const log_config_t *config) {
+    log_start_time = get_time_ms();
     if (g_log_state.initialized) {
         return 0; // Already initialized
     }
@@ -240,15 +243,15 @@ static void log_output_message(log_level_t level, const char *file, int line,
         fprintf(output, "%s", level_colors[level]);
     }
 
+    // Log level
+    fprintf(output, "[%s] ", level_names[level]);
+    
     // Timestamp
     if (g_log_state.config.enable_timestamp) {
         char timestamp[32];
         log_format_timestamp(timestamp, sizeof(timestamp));
         fprintf(output, "[%s] ", timestamp);
     }
-
-    // Log level
-    fprintf(output, "[%s] ", level_names[level]);
 
     // Node ID
     if (g_log_state.config.enable_node_id) {
@@ -282,18 +285,21 @@ static void log_output_message(log_level_t level, const char *file, int line,
 }
 
 static void log_format_timestamp(char *buffer, size_t buffer_size) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
+    // struct timeval tv;
+    // gettimeofday(&tv, NULL);
     
-    struct tm *tm_info = localtime(&tv.tv_sec);
-    if (tm_info == NULL) {
-        snprintf(buffer, buffer_size, "00:00:00.000");
-        return;
-    }
+    // struct tm *tm_info = localtime(&tv.tv_sec);
+    // if (tm_info == NULL) {
+    //     snprintf(buffer, buffer_size, "00:00:00.000");
+    //     return;
+    // }
     
-    snprintf(buffer, buffer_size, "%02d:%02d:%02d.%03ld",
-             tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec,
-             (long)(tv.tv_usec / 1000));
+    // snprintf(buffer, buffer_size, "%02d:%02d:%02d.%03ld",
+    //          tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec,
+    //          (long)(tv.tv_usec / 1000));
+
+    uint64_t elapsed_time = get_time_ms() - log_start_time;
+    snprintf(buffer, buffer_size, "%ld", elapsed_time);
 }
 
 static const char *log_get_filename(const char *filepath) {

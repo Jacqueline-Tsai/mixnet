@@ -34,7 +34,15 @@ extern "C" {
  * @param handle Network handle
  * @param config Node configuration
  */
-void lsa_init(void *handle, const struct mixnet_node_config *config);
+void lsa_init(const struct mixnet_node_config *config);
+
+/**
+ * @brief Send initial LSA packets to all neighbors
+ * 
+ * @param handle Network handle
+ * @param config Node configuration
+ */
+void lsa_send_init_packets(void *handle, const struct mixnet_node_config *config);
 
 /**
  * @brief Process received LSA packet
@@ -46,14 +54,6 @@ void lsa_init(void *handle, const struct mixnet_node_config *config);
  */
 void process_lsa_packet(mixnet_packet *packet, uint8_t port, 
                        const struct mixnet_node_config *config, void *handle);
-
-/**
- * @brief Send LSA packet to all neighbors
- * 
- * @param handle Network handle
- * @param config Node configuration
- */
-void lsa_send_init_packet(void *handle, const struct mixnet_node_config *config);
 
 /**
  * @brief Update forwarding table based on received LSA
@@ -111,11 +111,11 @@ void lsa_handle_link_failure(mixnet_address failed_neighbor);
  * 
  * This function implements Dijkstra's shortest path algorithm to find routes
  * from the current node (state.self.addr) to all nodes observed in the 
- * lsa_graph's adjacency_list.
+ * lsa_graph_t's adjacency_list.
  * 
  * @return 0 on success, -1 on failure
  */
-int lsa_compute_routes(void);
+void lsa_compute_routes(void);
 
 /**
  * @brief Print the LSA graph adjacency list
@@ -130,6 +130,29 @@ void lsa_print_graph(void);
  * This function prints all routes computed by lsa_compute_routes().
  */
 void lsa_print_routes(void);
+
+/**
+ * @brief Get port number for a given neighbor address
+ * 
+ * @param neighbor_addr Neighbor address to look up
+ * @return Port number if found, -1 if not found
+ */
+uint8_t get_port(mixnet_address neighbor_addr);
+
+/**
+ * @brief Get the index of the route for a given destination address
+ * 
+ * @param dst_addr Destination address
+ * @return Index of the route if found, -1 if not found
+ */
+uint8_t get_route_index(mixnet_address dst_addr);
+
+/**
+ * @brief Generate random routes
+ * 
+ * @param target_node Target node
+ */
+void generate_random_routes(mixnet_address target_node);
 
 #ifdef __cplusplus
 }

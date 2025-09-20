@@ -23,17 +23,15 @@
 
 
 // Internal function declarations
-static int send_lsa_packet(void *handle, uint8_t port, const struct mixnet_node_config *config);
+static int lsa_send_init_packet(void *handle, uint8_t port, const struct mixnet_node_config *config);
 
 // Helper function to create and send LSA packet
-static int send_lsa_packet(void *handle, uint8_t port, const struct mixnet_node_config *config) {
-    (void)config; // Suppress unused parameter warning
+static int lsa_send_init_packet(void *handle, uint8_t port, const struct mixnet_node_config *config) {
     LOG_DEBUG("Sending LSA packet to port %d", port);
     
     // Calculate packet size
     uint16_t payload_size = sizeof(mixnet_packet_lsa) + 
-                           (lsa_state.neighbor_count * sizeof(mixnet_lsa_link_params));
-    
+                           (config->num_neighbors * sizeof(mixnet_lsa_link_params));
     // Allocate packet
     mixnet_packet *packet = (mixnet_packet*)malloc(sizeof(mixnet_packet) + payload_size);
     if (!packet) return -1;
@@ -45,11 +43,13 @@ static int send_lsa_packet(void *handle, uint8_t port, const struct mixnet_node_
     // Set LSA payload
     mixnet_packet_lsa *lsa_payload = (mixnet_packet_lsa*)((char*)packet + sizeof(mixnet_packet));
     lsa_payload->node_address = node_state.self_address;
-    lsa_payload->neighbor_count = lsa_state.neighbor_count;
+    lsa_payload->neighbor_count = config->num_neighbors;
     
-    // Copy neighbor links
-    memcpy(lsa_payload->links, lsa_state.neighbor_links, 
-           lsa_state.neighbor_count * sizeof(mixnet_lsa_link_params));
+    // Pack neighbor links
+    for (uint16_t i = 0; i < config->num_neighbors; i++) {
+        lsa_payload->links[i].neighbor_mixaddr = node_state.neighbor_addrs[i];
+        lsa_payload->links[i].cost = config->link_costs[i];
+    }
     
     // Send packet
     int result = mixnet_send(handle, port, packet);
@@ -111,26 +111,31 @@ void process_lsa_packet(mixnet_packet *packet, uint8_t port,
     mixnet_packet_lsa *lsa_payload = (mixnet_packet_lsa*)((char*)packet + sizeof(mixnet_packet));
     mixnet_address sender_addr = lsa_payload->node_address;
 
-    LOG_DEBUG("Processing LSA packet on port %d (from %d), sender %d, with %d neighbors", port, node_state.neighbor_addrs[port], lsa_payload->node_address, lsa_payload->neighbor_count);
+    LOG_DEBUG("Processing LSA packet on port %d (from %d), sender %d, size %d, with %d neighbors", port, node_state.neighbor_addrs[port], lsa_payload->node_address, packet->total_size, lsa_payload->neighbor_count);
     
     // Check if this is our own LSA (ignore)
-    if (sender_addr == node_state.self_address || lsa_state.neighbor_heard_from[port]) {
+    if (sender_addr == node_state.self_address) {
+        LOG_INFO("Ignoring LSA packet | sender_addr (%d) == node_state.self_address (%d)", sender_addr, node_state.self_address);
         return;
     }
-    lsa_state.neighbor_heard_from[port] = true;
     
+    for (uint16_t i = 0; i < lsa_state.num_nodes; i++) {
+        if (lsa_state.addrs_heard_from[i] == sender_addr) {
+            LOG_INFO("Ignoring LSA packet | sender_addr (%d) already heard from", sender_addr);
+            return;
+        }
+    }
+
+    lsa_state.addrs_heard_from[lsa_state.num_nodes++] = sender_addr;
     // Process each neighbor link in the LSA
     for (uint16_t i = 0; i < lsa_payload->neighbor_count; i++) {
         mixnet_lsa_link_params *link = &lsa_payload->links[i];
-        mixnet_address destination = link->neighbor_mixaddr;
-        
-        uint16_t edge_idx = lsa_state.graph->num_edges;
-        lsa_state.graph->adjacency_list[edge_idx].from_addr = sender_addr;
-        lsa_state.graph->adjacency_list[edge_idx].to_addr = destination;
-        lsa_state.graph->adjacency_list[edge_idx].cost = link->cost;
+        lsa_state.graph->adjacency_list[lsa_state.graph->num_edges].from_addr = sender_addr;
+        lsa_state.graph->adjacency_list[lsa_state.graph->num_edges].to_addr = link->neighbor_mixaddr;
+        lsa_state.graph->adjacency_list[lsa_state.graph->num_edges].cost = link->cost;
         lsa_state.graph->num_edges++;
     }
-    
+    LOG_DEBUG("LSA graph updated with %d edges", lsa_state.graph->num_edges);
     // Forward LSA to other neighbors
     for (uint8_t p = 0; p < config->num_neighbors; p++) {
         if (p == port) {
@@ -142,70 +147,42 @@ void process_lsa_packet(mixnet_packet *packet, uint8_t port,
         mixnet_packet *fwd_packet = (mixnet_packet*)malloc(packet->total_size);
         memcpy(fwd_packet, packet, packet->total_size);
         mixnet_send(handle, p, fwd_packet);
-        free(fwd_packet);
     }
 }
 
-void lsa_init(void *handle, const struct mixnet_node_config *config) {
-    LOG_INFO("Initializing LSA");
-    // Wait for all neighbors addresses to be known
-    while (true) {
-        bool heard_from_all_neighbors = true;
-        for (uint8_t p = 0; p < config->num_neighbors; p++) {
-            if (node_state.neighbor_addrs[p] == INVALID_MIXADDR) {
-                heard_from_all_neighbors = false;
-                break;
-            }
-        }
-        if (heard_from_all_neighbors) {
-            break;
-        }
-        sleep(1);
+void lsa_send_init_packets(void *handle, const struct mixnet_node_config *config) {
+    LOG_INFO("Sending initial LSA packets");
+
+    // Put each neighbor link in the LSA graph
+    for (uint16_t i = 0; i < node_state.num_neighbors; i++) {        
+        lsa_state.graph->adjacency_list[i].from_addr = node_state.self_address;
+        lsa_state.graph->adjacency_list[i].to_addr = node_state.neighbor_addrs[i];
+        lsa_state.graph->adjacency_list[i].cost = config->link_costs[i];
     }
-    LOG_DEBUG("All neighbors addresses known. Starting LSA initialization");
+
+    // Send initial LSA to all neighbors
+    for (uint8_t p = 0; p < config->num_neighbors; p++) {
+        lsa_send_init_packet(handle, p, config);
+    }
+}
+
+void lsa_init(const struct mixnet_node_config *config) {
+    LOG_INFO("Initializing LSA");
+
     uint64_t current_time = get_time_ms();
     
     // Initialize state
-    node_state.self_address = config->node_addr;
-    node_state.stage = 0;
-    node_state.init_time = current_time;
-    lsa_state.neighbor_count = config->num_neighbors;
     lsa_state.last_lsa_time = current_time;
     
-    // Allocate neighbor links
-    lsa_state.neighbor_links = (mixnet_lsa_link_params*)calloc(config->num_neighbors, sizeof(mixnet_lsa_link_params));
-    
-    // Initialize neighbor links with direct neighbors
-    for (uint16_t i = 0; i < config->num_neighbors; i++) {
-        lsa_state.neighbor_links[i].neighbor_mixaddr = i; // Assuming neighbor addresses are 0, 1, 2, ...
-        lsa_state.neighbor_links[i].cost = config->link_costs ? config->link_costs[i] : 1;
-    }
-    
     // Allocate neighbor heard from tracking
-    lsa_state.neighbor_heard_from = (bool*)calloc(config->num_neighbors, sizeof(bool));
+    lsa_state.num_nodes = 1;
+    lsa_state.addrs_heard_from[0] = node_state.self_address;
     
-    lsa_state.graph = (lsa_graph*)calloc(1, sizeof(lsa_graph));
-    lsa_state.graph->num_edges = 0;
-    
-    // Allocate routes array
-    lsa_state.routes = (lsa_route*)calloc(LSA_MAX_DESTINATIONS, sizeof(lsa_route));
-    
-    // Send initial LSA to all neighbors
-    lsa_send_init_packet(handle, config);
+    lsa_state.graph = (lsa_graph_t*)calloc(1, sizeof(lsa_graph_t));
+    lsa_state.graph->num_edges = node_state.num_neighbors;
     
     LOG_INFO("LSA initialized for node %d with %d neighbors", 
              config->node_addr, config->num_neighbors);
-}
-
-
-void lsa_send_init_packet(void *handle, const struct mixnet_node_config *config) {
-    lsa_state.last_lsa_time = get_time_ms();
-    
-    LOG_DEBUG("Sending LSA to all neighbors");
-    
-    for (uint8_t p = 0; p < config->num_neighbors; p++) {
-        send_lsa_packet(handle, p, config);
-    }
 }
 
 
@@ -214,8 +191,103 @@ void lsa_send_init_packet(void *handle, const struct mixnet_node_config *config)
  * 
  * @param failed_neighbor Address of the neighbor whose link failed
  */
-void lsa_handle_link_failure(mixnet_address failed_neighbor) { 
+ void lsa_handle_link_failure(mixnet_address failed_neighbor) { 
     LOG_DEBUG("Handling link failure to neighbor %d", failed_neighbor);
+}
+
+int get_neighbors(mixnet_address node, mixnet_address *neighbors) {
+    uint8_t num_neighbors = 0;
+    for (uint16_t i = 0; i < lsa_state.graph->num_edges; i++) {
+        if (node !=lsa_state.graph->adjacency_list[i].from_addr) {
+            continue;
+        }
+        neighbors[num_neighbors++] = lsa_state.graph->adjacency_list[i].to_addr;
+    }
+    return num_neighbors;
+}
+
+int get_cost(mixnet_address node_1, mixnet_address node_2) {
+    for (uint16_t i = 0; i < lsa_state.graph->num_edges; i++) {
+        if (lsa_state.graph->adjacency_list[i].from_addr == node_1 && lsa_state.graph->adjacency_list[i].to_addr == node_2) {
+            return lsa_state.graph->adjacency_list[i].cost;
+        }
+    }
+    return LSA_INFINITY;
+}
+
+uint8_t get_index(mixnet_address node) {
+    for (uint16_t i = 0; i < lsa_state.num_nodes; i++) {
+        if (lsa_state.addrs_heard_from[i] == node) {
+            return i;
+        }
+    }
+    LOG_ERROR("get_index | node %d not found", node);
+    return -1;
+}
+
+/**
+ * @brief Get port number for a given neighbor address
+ * 
+ * @param neighbor_addr Neighbor address to look up
+ * @return Port number if found, -1 if not found
+ */
+uint8_t get_port(mixnet_address neighbor_addr) {
+    for (uint8_t p = 0; p < node_state.num_neighbors; p++) {
+        if (node_state.neighbor_addrs[p] == neighbor_addr) {
+            return p;
+        }
+    }
+    LOG_ERROR("get_port | neighbor %d not found", neighbor_addr);
+    return -1;
+}
+
+/**
+ * @brief Get the index of the route for a given destination address
+ * 
+ * @param dst_addr Destination address
+ * @return Index of the route if found, -1 if not found
+ */
+uint8_t get_route_index(mixnet_address dst_addr) {
+    for (uint8_t i = 0; i < lsa_state.num_nodes; i++) {
+        if (lsa_state.routes[i].dst_addr == dst_addr) {
+            return i;
+        }
+    }
+    LOG_ERROR("get_route_index | dst_addr %d not found", dst_addr);
+    return -1;
+}
+
+/**
+ * @brief Dijkstra's algorithm to find the shortest path
+ * 
+ * @param current_node Current node
+ * @param total_costs Total cost
+ * @param hop_count Hop count
+ * @param paths Paths
+ * @param random_routing Whether to use random routing
+ */
+void dijkstra(mixnet_address current_node, uint16_t total_costs, uint16_t hop_count, mixnet_address *paths) {
+    LOG_DEBUG("Dijkstra | current_node %d | total_costs %d | hop_count %d", current_node, total_costs, hop_count);
+    uint8_t index = get_index(current_node);
+    if (lsa_state.routes[index].cost <= total_costs) {
+        return;
+    }
+    lsa_state.routes[index].cost = total_costs;
+    lsa_state.routes[index].hop_count = hop_count;
+    lsa_state.routes[index].path = (mixnet_address*)calloc(hop_count, sizeof(mixnet_address));
+    memcpy(lsa_state.routes[index].path, paths, hop_count * sizeof(mixnet_address));
+    
+    mixnet_address neighbors[256];
+    uint8_t num_neighbors = get_neighbors(current_node, neighbors);
+    for (uint8_t i = 0; i < num_neighbors; i++) {
+        uint16_t cost = get_cost(current_node, neighbors[i]);
+        mixnet_address *new_paths = (mixnet_address*)calloc(hop_count + 1, sizeof(mixnet_address));
+        memcpy(new_paths, paths, hop_count * sizeof(mixnet_address));
+        new_paths[hop_count] = neighbors[i];
+
+        dijkstra(neighbors[i], cost + total_costs, hop_count + 1, new_paths);
+        free(new_paths);
+    }
 }
 
 /**
@@ -223,127 +295,102 @@ void lsa_handle_link_failure(mixnet_address failed_neighbor) {
  * 
  * This function implements Dijkstra's shortest path algorithm to find routes
  * from the current node (state.self.addr) to all nodes observed in the 
- * lsa_graph's adjacency_list.
+ * lsa_graph_t's adjacency_list.
  * 
  * @return 0 on success, -1 on failure
  */
-int lsa_compute_routes(void) {
-    if (!lsa_state.graph || !lsa_state.routes) {
-        LOG_ERROR("LSA graph or routes not initialized");
-        return -1;
+void lsa_compute_routes(void) {
+    LOG_INFO("Computing routes...");
+    if (!lsa_state.graph) {
+        LOG_ERROR("LSA graph not initialized");
     }
     
-    mixnet_address source = node_state.self_address;
-    uint16_t num_edges = lsa_state.graph->num_edges;
-    
-    // Find all unique nodes in the graph
-    mixnet_address nodes[256];
-    uint16_t num_nodes = 0;
-    bool node_exists[256] = {false};
-    
-    // Add source node
-    nodes[num_nodes++] = source;
-    node_exists[source] = true;
-    
-    // Add all nodes from adjacency list
-    for (uint16_t i = 0; i < num_edges; i++) {
-        mixnet_address from = lsa_state.graph->adjacency_list[i].from_addr;
-        mixnet_address to = lsa_state.graph->adjacency_list[i].to_addr;
-        
-        if (!node_exists[from]) {
-            nodes[num_nodes++] = from;
-            node_exists[from] = true;
-        }
-        if (!node_exists[to]) {
-            nodes[num_nodes++] = to;
-            node_exists[to] = true;
-        }
+    lsa_state.routes = (lsa_route_t*)calloc(lsa_state.num_nodes, sizeof(lsa_route_t));
+    for (uint16_t i = 0; i < lsa_state.num_nodes; i++) {
+        lsa_state.routes[i].dst_addr = lsa_state.addrs_heard_from[i];
+        lsa_state.routes[i].cost = LSA_INFINITY;
+        lsa_state.routes[i].path = NULL;
+        lsa_state.routes[i].hop_count = 0;
     }
-    
-    // Initialize distances and previous nodes
-    uint16_t distances[256];
-    mixnet_address previous[256];
-    bool visited[256] = {false};
-    
-    for (uint16_t i = 0; i < num_nodes; i++) {
-        distances[nodes[i]] = LSA_INFINITY;
-        previous[nodes[i]] = INVALID_MIXADDR;
-    }
-    distances[source] = 0;
-    
-    // Dijkstra's algorithm
-    for (uint16_t i = 0; i < num_nodes; i++) {
-        // Find unvisited node with minimum distance
-        mixnet_address current = INVALID_MIXADDR;
-        uint16_t min_dist = LSA_INFINITY;
-        
-        for (uint16_t j = 0; j < num_nodes; j++) {
-            mixnet_address node = nodes[j];
-            if (!visited[node] && distances[node] < min_dist) {
-                min_dist = distances[node];
-                current = node;
-            }
+    dijkstra(node_state.self_address, 0, 0, NULL);
+}
+
+void random_shuffle(mixnet_address *array, uint8_t size) {
+    LOG_DEBUG("Random shuffle | size %d", size);
+    for (uint8_t i = 0; i < size; i++) {
+        uint8_t j = rand() % size;
+        if (i == j) {
+            continue;
         }
-        
-        if (current == INVALID_MIXADDR) break;
-        visited[current] = true;
-        
-        // Update distances to neighbors
-        for (uint16_t j = 0; j < num_edges; j++) {
-            adjacency_edge *edge = &lsa_state.graph->adjacency_list[j];
-            if (edge->from_addr == current) {
-                mixnet_address neighbor = edge->to_addr;
-                uint16_t new_dist = distances[current] + edge->cost;
-                
-                if (new_dist < distances[neighbor]) {
-                    distances[neighbor] = new_dist;
-                    previous[neighbor] = current;
-                }
-            }
+        LOG_DEBUG("Swaping i %d | j %d | array[i] %d | array[j] %d", i, j, array[i], array[j]);
+        mixnet_address temp = array[i];
+        array[i] = array[j];
+        array[j] = temp;
+    }
+}
+
+/**
+ * @brief Random DFS to find a path to the target node
+ * 
+ * @param current_node Current node
+ * @param total_costs Total cost
+ * @param hop_count Hop count
+ * @param path Path
+ * @param target_node Target node
+ */
+bool random_dfs(mixnet_address current_node, uint16_t total_costs, uint16_t hop_count, mixnet_address *path, mixnet_address target_node) {
+    LOG_DEBUG("Random DFS | current_node %d | total_costs %d | hop_count %d | target_node %d", current_node, total_costs, hop_count, target_node);
+    path[hop_count] = current_node;
+    if (current_node == target_node) {
+        uint8_t node_i = get_index(current_node);
+        lsa_state.routes[node_i].cost = total_costs;
+        lsa_state.routes[node_i].hop_count = hop_count;
+        lsa_state.routes[node_i].path = (mixnet_address*)calloc(hop_count, sizeof(mixnet_address));
+        memcpy(lsa_state.routes[node_i].path, path + 1, hop_count * sizeof(mixnet_address));
+        LOG_DEBUG("Found target_node %d", current_node);
+        return true;
+    }
+    for (uint8_t i = 0; i < hop_count; i++) {
+        if (path[i] == current_node) {
+            LOG_DEBUG("Current_node %d already in path", current_node);
+            return false;
         }
     }
-    
-    // Build routes
-    uint16_t route_count = 0;
-    for (uint16_t i = 0; i < num_nodes; i++) {
-        mixnet_address dest = nodes[i];
-        if (dest == source) continue; // Skip self
-        
-        if (distances[dest] < LSA_INFINITY) {
-            // Count hops in path
-            uint16_t hop_count = 0;
-            mixnet_address path[256];
-            mixnet_address current = dest;
-            
-            while (current != source && current != INVALID_MIXADDR) {
-                path[hop_count++] = current;
-                current = previous[current];
-            }
-            
-            if (current == source) {
-                // Allocate memory for path
-                lsa_state.routes[route_count].dst_addr = dest;
-                lsa_state.routes[route_count].hop_count = hop_count;
-                lsa_state.routes[route_count].path = (mixnet_address*)malloc(hop_count * sizeof(mixnet_address));
-                
-                if (lsa_state.routes[route_count].path) {
-                    // Copy path in reverse order (from source to destination)
-                    for (uint16_t j = 0; j < hop_count; j++) {
-                        lsa_state.routes[route_count].path[j] = path[hop_count - 1 - j];
-                    }
-                    route_count++;
-                } else {
-                    LOG_ERROR("Failed to allocate memory for route path");
-                }
-            }
+
+    mixnet_address neighbors[256];
+    uint8_t num_neighbors = get_neighbors(current_node, neighbors);
+    LOG_DEBUG("Found num_neighbors %d for node %d", num_neighbors, current_node);
+    random_shuffle(neighbors, num_neighbors);
+    for (uint8_t i = 0; i < num_neighbors; i++) {
+        uint16_t cost = get_cost(current_node, neighbors[i]);
+        if (random_dfs(neighbors[i], total_costs + cost, hop_count + 1, path, target_node)) {
+            return true;
         }
     }
-    lsa_state.num_routes = route_count;
-    if (lsa_state.num_routes == 0) {
-        LOG_ERROR("No routes computed from node %d", source);
+    return false;
+}
+
+void generate_random_routes(mixnet_address target_node) {
+    LOG_INFO("Generating random routes...");
+    mixnet_address *paths = (mixnet_address*)calloc(lsa_state.num_nodes, sizeof(mixnet_address));
+    random_dfs(node_state.self_address, 0, 0, paths, target_node);
+    free(paths);
+
+    char buf[256];
+    int n = 0;
+    n += snprintf(buf + n, sizeof(buf) - n, "Random routes generated for node %d to %d | path length %d", node_state.self_address, target_node, lsa_state.routes[get_index(target_node)].hop_count - 1);
+    for (uint16_t i = 0; i < lsa_state.num_nodes; i++) {
+        if (lsa_state.routes[i].dst_addr != target_node) {
+            continue;
+        }
+        n += snprintf(buf + n, sizeof(buf) - n, "  Route to %d (%d hops, %d cost): ", lsa_state.routes[i].dst_addr, lsa_state.routes[i].hop_count, lsa_state.routes[i].cost);
+        for (uint16_t j = 0; j < lsa_state.routes[i].hop_count; j++) {
+            n += snprintf(buf + n, sizeof(buf) - n, "%d -> ", lsa_state.routes[i].path[j]);
+        }
+        n += snprintf(buf + n, sizeof(buf) - n, "End\n");
     }
-    LOG_DEBUG("Computed %d routes from node %d", route_count, source);
-    return 0;
+    LOG_DEBUG("%s", buf);
+
 }
 
 /**
@@ -359,14 +406,11 @@ void lsa_print_graph(void) {
     char buf[1024];
     size_t n = 0;
 
-    // Header
-    n += snprintf(buf + n, sizeof(buf) - n,
-                    "LSA Graph (from node %d)\n",
-                    node_state.self_address);
+    n += snprintf(buf + n, sizeof(buf) - n, "Printing LSA graph...");
+    n += snprintf(buf + n, sizeof(buf) - n, "LSA Graph (from node %d)\n", node_state.self_address);
 
     // Edge count
-    n += snprintf(buf + n, sizeof(buf) - n,
-                    "Number of edges: %d\n",
+    n += snprintf(buf + n, sizeof(buf) - n, "Number of edges: %d\n",
                     lsa_state.graph->num_edges);
 
     if (lsa_state.graph->num_edges == 0) {
@@ -380,7 +424,7 @@ void lsa_print_graph(void) {
     // Append each edge, guarding against buffer overflow
     for (uint16_t i = 0; i < lsa_state.graph->num_edges; i++) {
         if (n >= sizeof(buf)) { break; }
-        adjacency_edge *edge = &lsa_state.graph->adjacency_list[i];
+        adjacency_edge_t *edge = &lsa_state.graph->adjacency_list[i];
         n += snprintf(buf + n, sizeof(buf) - n,
                         "  Edge %d: %d -> %d (cost: %d)\n",
                         i, edge->from_addr, edge->to_addr, edge->cost);
@@ -394,34 +438,27 @@ void lsa_print_graph(void) {
  * This function prints all routes computed by lsa_compute_routes().
  */
 void lsa_print_routes(void) {
-    if (!lsa_state.routes || lsa_state.num_routes == 0) {
-        LOG_ERROR("LSA routes not initialized | lsa_state.num_routes %d | !lsa_state.routes %d", lsa_state.num_routes, !lsa_state.routes);
+    if (!lsa_state.routes || lsa_state.num_nodes == 0) {
+        LOG_ERROR("LSA routes not initialized | lsa_state.num_nodes %d | !lsa_state.routes %d", lsa_state.num_nodes, !lsa_state.routes);
         return;
     }
     
     char buf[1024];
-    sprintf(buf, "LSA Routes (from node %d):", node_state.self_address);
+    size_t n = 0;
+    n += snprintf(buf + n, sizeof(buf) - n, "Printing LSA routes...\n");
+    n += snprintf(buf + n, sizeof(buf) - n, "LSA Routes (from node %d):", node_state.self_address);
     
     bool has_routes = false;
-    for (int i = 0; i < lsa_state.num_routes; i++) {
-        lsa_route *route = &lsa_state.routes[i];
+    for (int i = 0; i < lsa_state.num_nodes; i++) {
+        lsa_route_t *route = &lsa_state.routes[i];
         
-        // Check if this route is valid (has a destination and path)
-        if (route->dst_addr != INVALID_MIXADDR && route->path != NULL) {
-            has_routes = true;
-            sprintf(buf, "  Route to %d (%d hops): ", route->dst_addr, route->hop_count);
-            
-            // Print the path
-            if (route->hop_count == 0) {
-                sprintf(buf, "    Direct connection");
-            } else {
-                sprintf(buf, "    %d", node_state.self_address);
-                for (uint16_t j = 0; j < route->hop_count; j++) {
-                    sprintf(buf, " -> %d", route->path[j]);
-                }
-                printf("\n");
-            }
+        n += snprintf(buf + n, sizeof(buf) - n, "  Route to %d (%d hops, %d cost): ", route->dst_addr, route->hop_count, route->cost);
+        
+        n += snprintf(buf + n, sizeof(buf) - n, "Start -> ");
+        for (uint16_t j = 0; j < route->hop_count; j++) {
+            n += snprintf(buf + n, sizeof(buf) - n, "%d -> ", route->path[j]);
         }
+        n += snprintf(buf + n, sizeof(buf) - n, "End\n");
     }
     LOG_DEBUG(buf);
     

@@ -62,8 +62,8 @@
               port, stp_payload->root_address, stp_payload->path_length, stp_payload->node_address);
      // Handle periodic hello messages
      if (stp_payload->root_address != stp_state.root_address || stp_payload->node_address != stp_state.root_address) {
-        LOG_ERROR("Invalid hello message: expected root=%d, sender=%d, got root=%d, sender=%d", 
-                  stp_state.root_address, stp_state.root_address, stp_payload->root_address, stp_payload->node_address);
+        LOG_ERROR("Invalid hello message: expected root=%d, sender port=%d, got root=%d, sender=%d", 
+                  stp_state.root_address, stp_state.parent_port, stp_payload->root_address, stp_payload->node_address);
          return;
      }
      if (stp_state.is_root) {
@@ -82,15 +82,11 @@
  
  void stp_init(void *handle, const struct mixnet_node_config *c) {
      uint64_t current_time = get_time_ms();
-    node_state.self_address = c->node_addr;
-    node_state.stage = 0;
-    node_state.init_time = current_time;
      stp_state.root_address = c->node_addr;  // Initially consider self as root
      stp_state.path_length = 0;
      stp_state.parent_port = -1;
      stp_state.is_root = true;
      stp_state.ports_blocked = (bool*)calloc(c->num_neighbors, sizeof(bool));
-     node_state.neighbor_addrs = (mixnet_address*)calloc(c->num_neighbors, sizeof(mixnet_address));
      stp_state.last_hello_time = current_time;
      stp_state.last_root_heard_time = UINT64_MAX;
  
@@ -108,18 +104,21 @@
     mixnet_address sender_root = stp_payload->root_address;
     uint16_t sender_path_len = stp_payload->path_length;
     mixnet_address sender_addr = stp_payload->node_address;
-    
-    node_state.neighbor_addrs[port] = sender_addr;
+
+    if (sender_path_len >= STP_HELLO_PATH_LEN_THRESHOLD) {
+        process_stp_hello_msg(stp_payload, port, config, handle);
+        return;
+    }
+
+    if (node_state.neighbor_addrs[port] == INVALID_MIXADDR) {
+        LOG_INFO("Heard from addr %d, port %d", sender_addr, port);
+        node_state.neighbor_addrs[port] = sender_addr;
+    }
  
     LOG_DEBUG("Processing STP packet from port %d: sender=%d, root=%d, path_length=%d", 
               port, sender_addr, sender_root, sender_path_len);
- 
-     if (sender_path_len >= STP_HELLO_PATH_LEN_THRESHOLD) {
-         process_stp_hello_msg(stp_payload, port, config, handle);
-         return;
-     }
- 
-     if (node_state.stage == 1) {
+
+     if (node_state.stage == 2) {
          LOG_DEBUG("Received STP election packet during convergence, restarting election");
          stp_init(handle, config);
          return;
@@ -189,7 +188,7 @@
  void stp_send_periodic_hello(void *handle, const struct mixnet_node_config *config) {
     // Check if we need to send periodic hello messages
     uint64_t current_time = get_time_ms();
-    if (node_state.stage != 1 || !stp_state.is_root || current_time < stp_state.last_hello_time ||
+    if (node_state.stage != 2 || !stp_state.is_root || current_time < stp_state.last_hello_time ||
         current_time - stp_state.last_hello_time < config->root_hello_interval_ms) {
         return;
     }
@@ -236,7 +235,7 @@
 }
 
  void stp_check_reelection(void *handle, const struct mixnet_node_config *config) {
-    if (stp_state.is_root || node_state.stage != 1) {
+    if (stp_state.is_root || node_state.stage != 2) {
         return;
     }
      

@@ -20,3 +20,11 @@ uint64_t get_time_ms(void) {
     }
     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
+
+void reverse_route(mixnet_packet_routing_header *routing_header) {
+    for (uint16_t i = 0; i < routing_header->route_length / 2; i++) {
+        mixnet_address temp = routing_header->route[i];
+        routing_header->route[i] = routing_header->route[routing_header->route_length - i - 1];
+        routing_header->route[routing_header->route_length - i - 1] = temp;
+    }
+}
