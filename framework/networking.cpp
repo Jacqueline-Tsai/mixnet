@@ -140,6 +140,9 @@ void server_accept(accept_args& args) {
             state->connection_fd = retval;
             args.num_accepted += 1;
 
+            // DEBUG: Print when connection is accepted
+            printf("[Orchestrator] Accepted connection #%d", args.num_accepted);
+
             // Configure the socket to be non-blocking
             const int flags = fcntl(retval, F_GETFL, 0);
             bool success = (flags >= 0 && fcntl(retval,

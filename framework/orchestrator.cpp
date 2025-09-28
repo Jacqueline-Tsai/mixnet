@@ -291,9 +291,14 @@ error_code orchestrator::run_state_setup_ctrl() {
     accept_args args(listen_fd_ctrl_, true,
             timeout_connect_ms_, num_nodes);
 
+    std::cout << "[Orchestrator] Starting to accept " << num_nodes 
+              << " connections on port " << PORT_LISTEN_CTRL << std::endl;
+    
     std::thread accept_thread(server_accept,
                               std::ref(args));
     while (!args.started) {}
+    
+    std::cout << "[Orchestrator] Accept thread started, waiting for connections..." << std::endl;
 
     bool success = true;
     if (autotest_mode_) {
@@ -327,14 +332,21 @@ error_code orchestrator::run_state_setup_ctrl() {
     else { fragments_.resize(num_nodes); }
     accept_thread.join();
 
+    std::cout << "[Orchestrator] Accept thread finished. Accepted " 
+              << args.num_accepted << " out of " << num_nodes << " expected connections" << std::endl;
+
     // Exit on error
     if (!success) {
+        std::cout << "[Orchestrator] Fork failed" << std::endl;
         return error_code::FORK_FAILED;
     }
     else if (args.rc != 0) {
+        std::cout << "[Orchestrator] Socket accept failed with rc=" << args.rc << std::endl;
         return error_code::SOCKET_ACCEPT_FAILED;
     }
     else if (args.num_accepted != num_nodes) {
+        std::cout << "[Orchestrator] Socket accept timeout - expected " << num_nodes 
+                  << " but got " << args.num_accepted << std::endl;
         return error_code::SOCKET_ACCEPT_TIMEOUT;
     }
     // Sanity check
